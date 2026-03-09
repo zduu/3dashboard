@@ -27,6 +27,13 @@ ACTION_MAP = {
     "resign-user": "助管离岗",
     "update-order-price": "修改价格",
     "recall-order": "撤回订单",
+    # Fallback types inferred from order tag history when assist-action endpoint is unavailable.
+    "status-wait-for-approval": "状态更新：待审核",
+    "status-printing": "状态更新：打印中",
+    "status-pickup": "状态更新：待取件",
+    "status-complete": "状态更新：已完成",
+    "status-refused": "状态更新：已拒绝",
+    "status-canceled": "状态更新：已取消",
 }
 
 
@@ -251,10 +258,58 @@ def filter_3d_assist(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for row in actions:
         operated = row.get("operated_orders")
-        if not isinstance(operated, list):
-            continue
-        if any(isinstance(o, dict) and is_3d_order(o) for o in operated):
+        if isinstance(operated, list) and any(isinstance(o, dict) and is_3d_order(o) for o in operated):
             out.append(row)
+            continue
+
+        # Some payloads may not include operated_orders; try direct order-like fields.
+        fallback_order = {
+            "process_type": row.get("process_type", ""),
+            "process_config": row.get("process_config"),
+        }
+        if is_3d_order(fallback_order):
+            out.append(row)
+    return out
+
+
+def build_actions_from_order_tags(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        tags = order.get("taginfo_list")
+        if not isinstance(tags, list):
+            continue
+
+        order_show_id = str(order.get("show_id") or order.get("id") or "")
+        order_type = str(order.get("process_type", "")).strip()
+        order_cfg = order.get("process_config")
+
+        for idx, tag in enumerate(tags, start=1):
+            if not isinstance(tag, dict):
+                continue
+            status = str(tag.get("status") or order.get("status") or "").strip().lower()
+            if not status:
+                continue
+
+            tag_time = str(tag.get("time") or order.get("update_at") or order.get("create_at") or "")
+            operator_name = str(tag.get("operator") or "").strip()
+            tag_type = str(tag.get("process_type") or order_type).strip()
+
+            out.append(
+                {
+                    "id": f"tag-{order_show_id}-{idx}-{tag_time}-{operator_name}-{status}",
+                    "action_type": f"status-{status}",
+                    "create_at": tag_time,
+                    "operator": {"nickname": operator_name},
+                    "operated_orders": [
+                        {
+                            "process_type": tag_type,
+                            "process_config": order_cfg,
+                        }
+                    ],
+                }
+            )
     return out
 
 
@@ -314,7 +369,10 @@ def build_3d_dataset(
     all_actions = endpoint_results.get("assist_action")
     if not isinstance(all_actions, list):
         all_actions = []
-    actions = dedupe_actions(filter_3d_assist([x for x in all_actions if isinstance(x, dict)]))
+    actions = filter_3d_assist([x for x in all_actions if isinstance(x, dict)])
+    if not actions:
+        actions = build_actions_from_order_tags(orders)
+    actions = dedupe_actions(actions)
 
     order_status = Counter()
     order_purpose = Counter()
@@ -364,6 +422,8 @@ def build_3d_dataset(
         op_name = ""
         if isinstance(operator, dict):
             op_name = str(operator.get("nickname", "")).strip()
+        elif isinstance(operator, str):
+            op_name = operator.strip()
 
         recent_actions.append(
             {

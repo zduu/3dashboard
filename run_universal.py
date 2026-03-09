@@ -22,6 +22,36 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def ensure_dashboard_placeholder(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    index_file = directory / "index.html"
+    if index_file.exists():
+        return
+    index_file.write_text(
+        """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard Loading</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; background: #f5f7fb; color: #1f2937; }
+    .box { text-align: center; padding: 24px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; }
+    .hint { color: #6b7280; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>看板准备中...</h2>
+    <div class="hint">正在执行首次抓取，完成后请刷新页面。</div>
+  </div>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+
 class LogHandler(SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         # Disable browser cache so dashboard updates are visible immediately.
@@ -52,20 +82,23 @@ def start_web_server(directory: Path, host: str, port: int) -> ThreadingHTTPServ
     return server
 
 
-def run_subprocess(cmd: list[str], cwd: Path) -> int:
+def run_subprocess(cmd: list[str], cwd: Path, interactive: bool = False) -> int:
     print(f"[{now_str()}] [TASK] Running: {' '.join(cmd)}")
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if proc.stdout.strip():
-        print(proc.stdout.strip())
-    if proc.stderr.strip():
-        print(proc.stderr.strip())
+    if interactive:
+        proc = subprocess.run(cmd, cwd=str(cwd))
+    else:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.stdout.strip():
+            print(proc.stdout.strip())
+        if proc.stderr.strip():
+            print(proc.stderr.strip())
     print(f"[{now_str()}] [TASK] Exit code: {proc.returncode}")
     return proc.returncode
 
@@ -164,6 +197,23 @@ def cleanup_output_dir(output_dir: Path, keep_output_runs: int, keep_single_file
     return removed_dirs, removed_files
 
 
+def has_usable_state(state_path: Path) -> bool:
+    if not state_path.exists() or not state_path.is_file():
+        return False
+    try:
+        with state_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    cookies = data.get("cookies")
+    origins = data.get("origins")
+    has_cookies = isinstance(cookies, list) and len(cookies) > 0
+    has_origins = isinstance(origins, list) and len(origins) > 0
+    return has_cookies or has_origins
+
+
 def build_main_common_args(args: argparse.Namespace) -> list[str]:
     common = [
         "--page-url",
@@ -186,7 +236,7 @@ def build_main_common_args(args: argparse.Namespace) -> list[str]:
 
 def run_login_if_needed(args: argparse.Namespace, cwd: Path) -> bool:
     state_path = (cwd / args.state_path).resolve()
-    if state_path.exists():
+    if has_usable_state(state_path):
         return True
 
     if not args.auto_login_if_missing_state:
@@ -197,7 +247,7 @@ def run_login_if_needed(args: argparse.Namespace, cwd: Path) -> bool:
         return False
 
     login_cmd = [args.python_exe, args.main_script, *build_main_common_args(args), "login"]
-    code = run_subprocess(login_cmd, cwd)
+    code = run_subprocess(login_cmd, cwd, interactive=True)
     return code == 0
 
 
@@ -212,6 +262,14 @@ def run_once(args: argparse.Namespace, cwd: Path) -> int:
         cmd.append("--single")
     code = run_subprocess(cmd, cwd)
     if code != 0:
+        if args.auto_login_if_missing_state:
+            print(f"[{now_str()}] [TASK] Fetch failed, retrying after re-login once...")
+            login_cmd = [args.python_exe, args.main_script, *build_main_common_args(args), "login"]
+            login_code = run_subprocess(login_cmd, cwd, interactive=True)
+            if login_code == 0:
+                code = run_subprocess(cmd, cwd)
+                if code == 0:
+                    return 0
         return code
 
     if args.single or not args.retry_once_on_missing_order_stats:
@@ -242,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-url", default="https://make.sjtu.edu.cn/admin/statistics/order-count", help="Target page URL.")
     parser.add_argument("--state-path", default="state/auth_state.json", help="Login state path.")
     parser.add_argument("--output-dir", default="output", help="Capture output directory.")
-    parser.add_argument("--browser-channel", default="msedge", help="Browser channel: msedge/chrome/chromium.")
+    parser.add_argument("--browser-channel", default="chrome", help="Browser channel: chrome/msedge/chromium.")
     parser.add_argument("--filter-selector", default="", help="Optional CSS selector for filter buttons.")
     parser.add_argument("--filter-wait-ms", type=int, default=3500, help="Wait after each filter click in ms.")
     parser.add_argument(
@@ -293,6 +351,7 @@ def main() -> int:
     cwd = Path(__file__).resolve().parent
     dashboard_dir = (cwd / args.dashboard_dir).resolve()
     output_dir = (cwd / args.output_dir).resolve()
+    ensure_dashboard_placeholder(dashboard_dir)
     if args.interval_minutes <= 0:
         print("[ERROR] --interval-minutes must be > 0")
         return 1
@@ -303,14 +362,15 @@ def main() -> int:
     server = start_web_server(dashboard_dir, args.host, args.port)
     interval = timedelta(minutes=args.interval_minutes)
     next_run = datetime.now() if not args.no_run_immediately else datetime.now() + interval
+    last_interrupt_ts = 0.0
     if not args.no_clean_output:
         d, f = cleanup_output_dir(output_dir, args.keep_output_runs, args.keep_single_files)
         if d or f:
             print(f"[{now_str()}] [CLEAN] Removed {d} old run dirs and {f} old files.")
     print(f"[{now_str()}] [TASK] Interval: every {args.interval_minutes} minutes")
 
-    try:
-        while True:
+    while True:
+        try:
             now = datetime.now()
             if now >= next_run:
                 started = time.time()
@@ -325,10 +385,16 @@ def main() -> int:
                 next_run = datetime.now() + interval
                 print(f"[{now_str()}] [TASK] Next run at: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
             time.sleep(1.0)
-    except KeyboardInterrupt:
-        print(f"[{now_str()}] [SYS] Stopped by user.")
-        server.shutdown()
-        return 0
+        except KeyboardInterrupt:
+            ts = time.time()
+            # VS Code "Run" may emit a single SIGINT; require double Ctrl+C to exit.
+            if ts - last_interrupt_ts <= 3.0:
+                print(f"[{now_str()}] [SYS] Stopped by user.")
+                server.shutdown()
+                return 0
+            last_interrupt_ts = ts
+            print(f"[{now_str()}] [SYS] Interrupt received. Press Ctrl+C again within 3s to stop.")
+            next_run = datetime.now()
 
 
 if __name__ == "__main__":
